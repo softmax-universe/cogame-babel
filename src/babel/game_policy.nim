@@ -201,19 +201,10 @@ proc scriptedAction*(view: JsonNode): JsonNode =
 proc extractJsonObject*(text: string): JsonNode =
   ## Parses a strict JSON object, allowing a single standard outer Markdown JSON fence.
   var candidate = text.strip()
-  if candidate.startsWith("```"):
-    let nl = candidate.find('\n')
-    if nl < 0 or not candidate.endsWith("```"):
-      raise newException(BabelError, "malformed Markdown JSON fence")
-    let lang = candidate[3 ..< nl].strip().toLowerAscii()
-    if lang notin ["", "json"]:
-      raise newException(BabelError, "unsupported Markdown fence language: " & lang)
-    let inner = candidate[nl + 1 ..< candidate.len - 3]
-    if inner.len == 0 or (inner[^1] != '\n' and inner[^1] != '\r'):
-      raise newException(BabelError, "closing Markdown fence must be on its own line")
-    candidate = inner.strip()
-  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
-    raise newException(BabelError, "response must be a JSON object")
+  if candidate.len >= 6 and candidate.startsWith("```") and candidate.endsWith("```"):
+    candidate = candidate[3 ..< candidate.len - 3].strip()
+    if candidate.toLowerAscii().startsWith("json"):
+      candidate = candidate[4 .. ^1].strip()
   try:
     result = parseJson(candidate)
   except CatchableError as error:
