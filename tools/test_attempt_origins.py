@@ -54,31 +54,39 @@ for origin in ("first-finished-start", "teacher", "human", "model-mismatch", "mo
                 for process in processes: assert process.wait(timeout=40) == 0
                 events = [json.loads(line) for line in (output / "trajectory.jsonl").read_text().splitlines()]
                 unresolved = origin in {"stale-stop", "premature-stop"}
-                assert events[-1]["status"] == ("truncated" if unresolved else "completed")
-                assert len(events[:-1]) == 8
-                if unresolved:
+                failing = origin in {"first-finished-start", "model-mismatch", "model-body-mismatch", "scripted-model-body-mismatch"}
+                assert events[-1]["status"] == ("failed" if failing else "truncated" if unresolved else "completed")
+                assert len(events[:-1]) == (1 if failing else 8)
+                if failing:
+                    assert not (output / "results.json").exists() and not (output / "replay.json").exists()
+                    assert events[-1]["participant_outcomes"] is None
+                elif unresolved:
                     assert (output / "results.json").exists() and (output / "replay.json").exists()
                     assert events[-1]["participant_outcomes"] is None
                     assert set(events[-1]["outcome"]["player_cleanup"].values()) == {"unresolved"}
                 for decision in events[:-1]:
+                    assert decision["fallback_origin"] is None
                     if origin == "first-finished-start":
                         assert decision["attempts"] == []
-                        assert decision["action_status"] == "fallback" and decision["selected_attempt_id"] is None
+                        assert decision["action_status"] == "missing" and decision["selected_attempt_id"] is None
+                        assert decision["executed_action"] is None
                         continue
                     attempt = decision["attempts"][0]
                     if origin in {"model-body-mismatch", "scripted-model-body-mismatch"}:
                         assert attempt["origin"] == "model" and not attempt["accepted"]
                         assert attempt["parsed_action"] is None
-                        assert decision["action_status"] == "fallback" and decision["selected_attempt_id"] is None
+                        assert decision["action_status"] == "missing" and decision["selected_attempt_id"] is None
+                        assert decision["executed_action"] is None
                     elif origin == "model-mismatch":
                         assert attempt["origin"] == "model" and not attempt["accepted"]
                         assert attempt["parsed_action"] == json.loads(attempt["response"])
-                        assert decision["action_status"] == "fallback" and decision["selected_attempt_id"] is None
+                        assert decision["action_status"] == "rejected" and decision["selected_attempt_id"] is None
+                        assert decision["executed_action"] is None
                     else:
                         assert attempt["origin"] == "unknown" and attempt["accepted"]
                         assert decision["action_status"] == "accepted"
                         assert attempt["parsed_action"] == decision["executed_action"]
-                print(origin, "eight decisions; no teacher/model target granted", flush=True)
+                print(origin, len(events[:-1]), "decisions; no teacher/model target granted", flush=True)
             finally:
                 for process in processes:
                     if process.poll() is None: process.terminate()

@@ -321,8 +321,7 @@ proc beginRound*(sim: var Sim) =
 proc applySpeak*(sim: var Sim, pair: int, tokens: seq[int], notes: string,
     scripted: bool) =
   ## The speaker of `pair` sends its message. Raises BabelError on anything
-  ## illegal; the game server falls back to the scripted baseline on a
-  ## rejection.
+  ## illegal.
   if sim.done:
     raise newException(BabelError, "the episode is over")
   let expected = if sim.phase == phSpeak0: 0 elif sim.phase == phSpeak1: 1
@@ -366,7 +365,7 @@ proc applyPick*(sim: var Sim, pair, pick: int, notes: string,
   if pair != expected:
     raise newException(BabelError, "pair " & $expected & " picks now")
   if pick < 0 or pick >= LineupSize:
-    raise newException(BabelError, "pick must be A-D")
+    raise newException(BabelError, "pick must be 0..3")
   let plan = sim.plan
   let speaker = plan.speakers[pair]
   let listener = plan.listeners[pair]

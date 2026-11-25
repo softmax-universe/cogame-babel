@@ -127,7 +127,6 @@ when isMainModule:
   doAssert variant["id"].getStr() == "standard"
   var game: Sim
   var client: LlmClient
-  var fallbackPolicy: ScriptedPolicy
   var id = 0
   var selection: PromptSelection
   while not stdin.endOfFile:
@@ -152,7 +151,6 @@ when isMainModule:
       game = initSim(config)
       game.beginRound()
       client = newScriptedClient(seed)
-      fallbackPolicy = newScriptedPolicy(seed)
       id = 0
       response = game.decision(id, language, operatorPrompt, selection)
     of "encode":
@@ -164,15 +162,17 @@ when isMainModule:
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
       let call = game.currentCall()
-      var action: JsonNode
+      var action = newJNull()
       var rejection = ""
+      let rawResponse = request["response"].getStr()
       if language:
-        let resolution = game.resolveAction(call, request["response"].getStr(),
-          game.decisionView(call), false, fallbackPolicy)
-        action = game.actionJson(call, resolution.decision)
-        rejection = resolution.rejection
+        let resolution = game.resolveAction(call, rawResponse, false)
+        if resolution.accepted:
+          action = game.actionJson(call, resolution.decision)
+        else:
+          rejection = resolution.rejection
       else:
-        action = parseJson(request["response"].getStr())
+        action = parseJson(rawResponse)
         for head in heads():
           doAssert action[head["name"].getStr()] in head["choices"]
         var payload: JsonNode
@@ -184,11 +184,16 @@ when isMainModule:
           let parsed = game.parseSpeak(call.seat, payload)
           game.applySpeak(call.pair, parsed.tokens, parsed.notes, false)
         else:
-          payload = %*{"pick": lineupLetter(action["pick"].getInt()), "notes": ""}
+          payload = %*{"pick": action["pick"].getInt(), "notes": ""}
           let parsed = parsePick(payload)
           game.applyPick(call.pair, parsed.pick, parsed.notes, false)
       inc id
-      if game.done:
+      if rejection.len > 0:
+        game.done = true
+        response = %*{"kind": "rejected", "action": newJNull(),
+          "reason": rejection, "raw_response": rawResponse,
+          "observation": %*{"kind": "terminal", "scores": newJNull()}}
+      elif game.done:
         var scores = newJObject()
         for seat in 0 ..< Seats:
           scores[$seat] = %game.score(seat)
@@ -199,9 +204,6 @@ when isMainModule:
           game.beginRound()
         response = %*{"kind": "accepted", "action": action,
           "observation": game.decision(id, language, operatorPrompt, selection)}
-      if rejection.len > 0:
-        response["kind"] = %"consumed_rejection"
-        response["reason"] = %rejection
     else:
       raise newException(ValueError, "unknown command: " & request["kind"].getStr())
     stdout.writeLine($response)

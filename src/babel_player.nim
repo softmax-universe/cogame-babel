@@ -54,8 +54,10 @@ proc runDecision(call: PlayerCall) {.gcsafe.} =
   if call.scripted:
     action = scriptedAction(observation)
   elif client.disabled:
-    action = scriptedAction(observation)
-    source = "fallback"
+    failure = "no native LLM endpoint configured"
+    echo "babel player: ", failure
+    action = newJNull()
+    source = "error"
   else:
     client.beforeCall = proc(evidence: LlmCallEvidence) {.gcsafe.} =
       let started = evidence.privateAttempt(call.decisionId & "-model").attemptEvidenceJson()
@@ -70,15 +72,18 @@ proc runDecision(call: PlayerCall) {.gcsafe.} =
       source = "llm"
     except CatchableError as error:
       failure = error.msg
-      echo "babel player: model call failed; using scripted fallback"
-      action = scriptedAction(observation)
-      source = "fallback"
+      echo "babel player: model call failed"
+      action = newJNull()
+      source = "error"
     attempt = client.lastCall.privateAttempt(call.decisionId & "-model", failure).attemptEvidenceJson()
     {.gcsafe.}:
       withLock evidenceLock: workerEvidence = $attempt
   if not interruptionRequested():
-    discard call.socket[].sendNativeText($(%*{"type": "action", "decision_id": call.decisionId,
-      "action": action, "source": source, "training_attempt": attempt}), call.deadline)
+    var frame = %*{"type": "action", "decision_id": call.decisionId,
+      "action": action, "source": source, "training_attempt": attempt}
+    if failure.len > 0:
+      frame["error"] = %failure
+    discard call.socket[].sendNativeText($frame, call.deadline)
 
 proc stopAndAcknowledge(socket: NativeWebSocket, decisionId, stopId: JsonNode,
     cleanupDeadline: MonoTime): bool =

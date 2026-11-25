@@ -1,4 +1,4 @@
-## Game-owned action parsing and scripted fallback. No model transport.
+## Game-owned action parsing and scripted baseline. No fallback or model transport.
 
 import std/[json, options, random, strutils, tables, unicode]
 import sim
@@ -15,7 +15,7 @@ type
     decision*: Decision
     proposedAction*: JsonNode
     accepted*: bool
-    rejection*, fallbackOrigin*: string
+    rejection*: string
 
   ScriptedPolicy* = ref object
     rand: Rand
@@ -103,61 +103,49 @@ proc cleanNotes*(text: string): string =
     return
   result = result.runeSubStr(0, MaxNotesLen - 1) & "…"
 
+proc parseNotes(payload: JsonNode): string =
+  if not payload.hasKey("notes") or payload["notes"].kind == JNull:
+    return ""
+  if payload["notes"].kind != JString:
+    raise newException(BabelError, "notes must be a string")
+  cleanNotes(payload["notes"].getStr())
+
 proc parseSpeak*(sim: Sim, seat: int, payload: JsonNode): Decision =
-  ## Maps the model's JSON onto token ids through the seat's own view:
-  ## "tokens" is an array of single glyphs, or one string of glyphs
-  ## separated by spaces. Any glyph outside the alphabet is an invalid
-  ## reply. Length is checked by applySpeak.
-  result.notes = cleanNotes(payload{"notes"}.getStr())
-  let node = payload{"tokens"}
-  var glyphs: seq[string]
-  if node.isNil:
+  ## Maps the canonical speaker JSON onto token ids through the seat's own view:
+  ## "tokens" must be an array of 1..8 single glyphs from this seat's alphabet.
+  if payload.kind != JObject:
+    raise newException(BabelError, "speaker action must be a JSON object")
+  result.notes = parseNotes(payload)
+  if not payload.hasKey("tokens"):
     raise newException(BabelError, "no tokens in response")
-  case node.kind
-  of JArray:
-    for entry in node:
-      if entry.kind != JString:
-        raise newException(BabelError, "tokens must be glyph strings")
-      glyphs.add(strutils.strip(entry.getStr()))
-  of JString:
-    for part in strutils.splitWhitespace(node.getStr()):
-      glyphs.add(part)
-  else:
+  let node = payload["tokens"]
+  if node.kind != JArray:
     raise newException(BabelError, "tokens must be an array of glyphs")
-  for glyph in glyphs:
+  for entry in node:
+    if entry.kind != JString:
+      raise newException(BabelError, "tokens must be glyph strings")
+    let glyph = entry.getStr()
     if glyph.runeLen != 1:
       raise newException(BabelError,
-        "each token must be exactly one glyph: " & glyph)
+        "each token must be exactly one glyph: " & glyph.escape)
     result.tokens.add(sim.tokenOf(seat, glyph))
+  if result.tokens.len < 1 or result.tokens.len > MaxMessage:
+    raise newException(BabelError,
+      "a message is 1.." & $MaxMessage & " tokens")
 
 proc parsePick*(payload: JsonNode): Decision =
-  ## "pick" is a letter A-D (any case, trailing text tolerated), or an
-  ## integer: 0..3 as an index, 4 as the 1-based D.
-  result.notes = cleanNotes(payload{"notes"}.getStr())
-  let node = payload{"pick"}
-  if node.isNil:
+  ## Canonical listener action: "pick" must be an integer 0..3.
+  if payload.kind != JObject:
+    raise newException(BabelError, "listener action must be a JSON object")
+  result.notes = parseNotes(payload)
+  if not payload.hasKey("pick"):
     raise newException(BabelError, "no pick in response")
-  var pick = -1
-  case node.kind
-  of JInt:
-    pick = node.getInt()
-    if pick == LineupSize:
-      pick = LineupSize - 1
-  of JString:
-    let text = strutils.strip(node.getStr())
-    if text.len == 0:
-      raise newException(BabelError, "empty pick")
-    let head = text[0].toUpperAscii()
-    if head in 'A' .. 'D':
-      pick = ord(head) - ord('A')
-    elif head in '0' .. '9':
-      pick = ord(head) - ord('0')
-      if pick == LineupSize:
-        pick = LineupSize - 1
-  else:
-    discard
+  let node = payload["pick"]
+  if node.kind != JInt:
+    raise newException(BabelError, "pick must be an integer 0..3: " & $node)
+  let pick = node.getInt()
   if pick < 0 or pick >= LineupSize:
-    raise newException(BabelError, "pick must be A-D: " & $node)
+    raise newException(BabelError, "pick must be an integer 0..3: " & $node)
   result.pick = pick
 
 proc actionJson*(sim: Sim, call: Call, decision: Decision): JsonNode =
@@ -211,35 +199,41 @@ proc scriptedAction*(view: JsonNode): JsonNode =
 
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model
-    ## sent instead of JSON (prose, a refusal, a cut-off analysis...).
+  ## Parses a strict JSON object, allowing a single standard outer Markdown JSON fence.
+  var candidate = text.strip()
+  if candidate.startsWith("```"):
+    let nl = candidate.find('\n')
+    if nl < 0 or not candidate.endsWith("```"):
+      raise newException(BabelError, "malformed Markdown JSON fence")
+    let lang = candidate[3 ..< nl].strip().toLowerAscii()
+    if lang notin ["", "json"]:
+      raise newException(BabelError, "unsupported Markdown fence language: " & lang)
+    let inner = candidate[nl + 1 ..< candidate.len - 3]
+    if inner.len == 0 or (inner[^1] != '\n' and inner[^1] != '\r'):
+      raise newException(BabelError, "closing Markdown fence must be on its own line")
+    candidate = inner.strip()
+  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
     var head = text.strip()
     if head.len > 160:
       head = head[0 ..< 160] & "..."
-    raise newException(BabelError, "no JSON object in response: " &
+    raise newException(BabelError, "response must be a JSON object: " &
       head.replace("\n", " "))
-  parseJson(text[start .. stop])
+  try:
+    result = parseJson(candidate)
+  except CatchableError as error:
+    raise newException(BabelError, "invalid JSON object: " & error.msg)
+  if result.kind != JObject:
+    raise newException(BabelError, "response must be a JSON object")
 
 
 proc resolveAction*(sim: var Sim, call: Call, rawResponse: string,
-    privateView: JsonNode, scripted: bool, fallbackPolicy: ScriptedPolicy,
-    modelResponse = none(string)): ActionResolution =
-  ## The existing player/server rejection flow, shared with the language bridge.
-  var payload: JsonNode
+    scripted: bool, modelResponse = none(string)): ActionResolution =
+  ## Shared player/server/bridge action resolution. Rejected actions never
+  ## apply or synthesize a legal action and leave the simulation untouched.
   result.accepted = true
   result.proposedAction = newJNull()
   try:
-    payload = extractJsonObject(rawResponse)
-  except CatchableError as error:
-    result.accepted = false
-    result.rejection = error.msg
-    result.fallbackOrigin = "player-scripted-parse"
-    payload = scriptedAction(privateView)
-  try:
+    let payload = extractJsonObject(rawResponse)
     if modelResponse.isSome:
       let sampled = extractJsonObject(modelResponse.get())
       let sampledDecision = if call.kind == ckSpeak:
@@ -250,20 +244,14 @@ proc resolveAction*(sim: var Sim, call: Call, rawResponse: string,
     if modelResponse.isSome:
       if result.proposedAction != sim.actionJson(call, result.decision):
         raise newException(BabelError, "model response differs from player action")
-    elif result.accepted:
+    else:
       result.proposedAction = sim.actionJson(call, result.decision)
     if call.kind == ckSpeak:
       sim.applySpeak(call.pair, result.decision.tokens, result.decision.notes,
-        scripted or not result.accepted)
+        scripted)
     else:
       sim.applyPick(call.pair, result.decision.pick, result.decision.notes,
-        scripted or not result.accepted)
-  except BabelError as error:
+        scripted)
+  except CatchableError as error:
     result.accepted = false
     result.rejection = error.msg
-    result.fallbackOrigin = "game-scripted-invalid-action"
-    result.decision = fallbackPolicy.scriptedAction(sim, call)
-    if call.kind == ckSpeak:
-      sim.applySpeak(call.pair, result.decision.tokens, result.decision.notes, true)
-    else:
-      sim.applyPick(call.pair, result.decision.pick, result.decision.notes, true)

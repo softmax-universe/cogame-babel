@@ -65,4 +65,12 @@ jobs:
       - name: Build images and static replay viewer
         run: uvx --from 'coworld[auth]==0.1.56' coworld build --version 0.1.4
       - name: Certify bundled prompt and scripted seats locally
-        run: uvx --from 'coworld[auth]==0.1.56' coworld certify --timeout-seconds 300 --no-open-report dist/coworld_manifest.json
+        run: |
+          set -euo pipefail
+          python3 tools/cert_llm_fixture.py 18551 &
+          fixture_pid=$!
+          trap 'kill -TERM "$fixture_pid" 2>/dev/null || true' EXIT
+          gateway=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+          jq --arg endpoint "http://$gateway:18551" '(.player[] | select(.id == "babel-player") | .env.COWORLD_LLM_ENDPOINT) = $endpoint' \
+            dist/coworld_manifest.json > dist/certification-test.json
+          uvx --from 'coworld[auth]==0.1.56' coworld certify --timeout-seconds 300 --no-open-report dist/certification-test.json

@@ -109,10 +109,10 @@ for case in ("started-sigterm", "partial-sigterm", "partial-sigint", "player-sig
             assert player.wait(timeout=1) == expected_exit
         events = [json.loads(line) for line in (output / "trajectory.jsonl").read_text().splitlines()]
         episode = events[-1]
-        assert episode["status"] == "truncated" and episode["participant_outcomes"] is None
-        scored = case in {"player-sigterm", "disconnected"}
-        assert (output / "results.json").exists() == scored
-        assert (output / "replay.json").exists() == scored
+        expected_status = "failed" if case in {"player-sigterm", "disconnected"} else "truncated"
+        assert episode["status"] == expected_status and episode["participant_outcomes"] is None
+        assert not (output / "results.json").exists()
+        assert not (output / "replay.json").exists()
         attempts = [attempt for event in events if event["event_type"] == "decision" for attempt in event["attempts"]]
         native = [attempt for attempt in attempts if attempt["origin"] == "model"]
         assert len(native) == 1

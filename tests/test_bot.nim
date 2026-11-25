@@ -1,8 +1,8 @@
 ## The scripted baseline must play whole episodes without ever proposing
-## an illegal message or pick — it is both the no-credentials fallback
-## (offline certification) and a fieldable policy, so this is the
-## completion path. Two scripted seats must also actually converge on the
-## fixed code, or the baseline is no partner worth adapting to.
+## an illegal message or pick — it is an explicitly chosen policy for
+## opponents and offline certification. Two scripted seats must also
+## actually converge on the fixed code, or the baseline is no partner
+## worth adapting to.
 
 import std/[json, monotimes, times, unicode, unittest]
 import babel/[llm, sim]
@@ -89,51 +89,96 @@ suite "scripted baseline":
     sim.applyPick(0, picked.pick, picked.notes, true)
     check sim.currentCall() == (ckSpeak, 1, sim.plan.speakers[1])
 
-  test "model replies parse through the seat's own view":
+  test "canonical actions parse strictly and support outer Markdown JSON fences":
     let config = fixture(0)
     var sim = initSim(config)
     sim.beginRound()
     let seat = sim.plan.speakers[0]
-    let view = sim.glyphOf(seat, 3) & " " & sim.glyphOf(seat, 9) & " " &
-      sim.glyphOf(seat, 14)
-    let arrayReply = parseSpeak(sim, seat, parseJson(
-      """{"tokens":["""" & sim.glyphOf(seat, 3) & """","""" &
-      sim.glyphOf(seat, 9) & """","""" & sim.glyphOf(seat, 14) &
-      """"],"notes":"first = shape"}"""))
+    let g3 = sim.glyphOf(seat, 3)
+    let g9 = sim.glyphOf(seat, 9)
+    let g14 = sim.glyphOf(seat, 14)
+    let arrayJson = """{"tokens":["""" & g3 & """","""" & g9 & """","""" & g14 & """"],"notes":"first = shape"}"""
+    let arrayReply = parseSpeak(sim, seat, extractJsonObject(arrayJson))
     check arrayReply.tokens == @[3, 9, 14]
     check arrayReply.notes == "first = shape"
-    let stringReply = parseSpeak(sim, seat, parseJson(
-      """{"tokens":"""" & view & """"}"""))
-    check stringReply.tokens == @[3, 9, 14]
-    check stringReply.notes == ""
+    ## Standard outer Markdown JSON fences are supported.
+    let fenced = extractJsonObject("```json\n" & arrayJson & "\n```")
+    check parseSpeak(sim, seat, fenced).tokens == @[3, 9, 14]
+    let plainFence = extractJsonObject("```\n{\"pick\":2}\n```")
+    check parsePick(plainFence).pick == 2
+    ## Prose-wrapped JSON and non-object JSON are rejected.
+    expect BabelError:
+      discard extractJsonObject("Here is my move: {\"pick\":2}")
+    expect BabelError:
+      discard extractJsonObject("{\"pick\":2} thanks")
+    expect BabelError:
+      discard extractJsonObject("[0, 1]")
     ## The same glyphs mean different tokens from another seat's view.
     let other = sim.plan.listeners[0]
-    let crossed = parseSpeak(sim, other, parseJson(
-      """{"tokens":"""" & view & """"}"""))
+    let crossed = parseSpeak(sim, other, parseJson(arrayJson))
     check crossed.tokens != @[3, 9, 14]
+    ## Redundant speaker aliases and malformed fields are rejected.
+    expect BabelError:
+      discard parseSpeak(sim, seat, parseJson(
+        """{"tokens":"""" & g3 & " " & g9 & " " & g14 & """"}"""))
+    expect BabelError:
+      discard parseSpeak(sim, seat, parseJson("""{"tokens":[]}"""))
     expect BabelError:
       discard parseSpeak(sim, seat, parseJson("""{"tokens":["Z"]}"""))
     expect BabelError:
       discard parseSpeak(sim, seat, parseJson(
-        """{"tokens":["""" & sim.glyphOf(seat, 3) & sim.glyphOf(seat, 4) &
-        """"]}"""))
+        """{"tokens":["""" & g3 & sim.glyphOf(seat, 4) & """"]}"""))
     expect BabelError:
       discard parseSpeak(sim, seat, parseJson("""{"notes":"?"}"""))
-    check parsePick(parseJson("""{"pick":"B"}""")).pick == 1
-    check parsePick(parseJson("""{"pick":"d"}""")).pick == 3
-    check parsePick(parseJson("""{"pick":"C) 3 green circles"}""")).pick == 2
+    expect BabelError:
+      discard parseSpeak(sim, seat, parseJson(
+        """{"tokens":["""" & g3 & """"],"notes":123}"""))
+    ## Canonical listener pick is integer 0..3 with optional string notes.
     check parsePick(parseJson("""{"pick":0}""")).pick == 0
     check parsePick(parseJson("""{"pick":2}""")).pick == 2
-    check parsePick(parseJson("""{"pick":4}""")).pick == 3
-    check parsePick(parseJson("""{"pick":"1"}""")).pick == 1
-    check parsePick(parseJson("""{"pick":"A","notes":"x"}""")).notes == "x"
-    expect BabelError:
-      discard parsePick(parseJson("""{"pick":"E"}"""))
-    expect BabelError:
-      discard parsePick(parseJson("""{"pick":7}"""))
-    expect BabelError:
-      discard parsePick(parseJson("""{"notes":"no pick"}"""))
+    check parsePick(parseJson("""{"pick":3,"notes":"x"}""")).notes == "x"
+    ## Letter/string/1-based aliases and out-of-range picks are rejected.
+    for bad in [
+      """{"pick":"A"}""",
+      """{"pick":"B"}""",
+      """{"pick":"d"}""",
+      """{"pick":"C) 3 green circles"}""",
+      """{"pick":"0"}""",
+      """{"pick":"1"}""",
+      """{"pick":4}""",
+      """{"pick":-1}""",
+      """{"pick":7}""",
+      """{"pick":1,"notes":42}""",
+      """{"notes":"no pick"}"""
+    ]:
+      expect BabelError:
+        discard parsePick(parseJson(bad))
     var long = ""
     for index in 0 ..< 700:
       long.add("é")
     check cleanNotes(long).runeLen == MaxNotesLen
+
+  test "rejected actions apply no legal move and leave simulation untouched":
+    var sim = initSim(fixture(7, rounds = 4))
+    sim.beginRound()
+    let speakCall = sim.currentCall()
+    let eventsBeforeSpeak = sim.events.len
+    let speakRes = sim.resolveAction(speakCall, "not json", false)
+    check not speakRes.accepted
+    check speakRes.rejection.len > 0
+    check sim.events.len == eventsBeforeSpeak
+    check sim.currentCall() == speakCall
+    check sim.tokens[speakCall.pair].len == 0
+    ## Apply a valid speak, then verify rejected listener pick leaves sim untouched.
+    let validSpeak = sim.resolveAction(speakCall,
+      """{"tokens":["""" & sim.glyphOf(speakCall.seat, 0) & """"]}""", false)
+    check validSpeak.accepted
+    let pickCall = sim.currentCall()
+    let eventsBeforePick = sim.events.len
+    let pickRes = sim.resolveAction(pickCall, """{"pick":"A"}""", false)
+    check not pickRes.accepted
+    check pickRes.rejection.len > 0
+    check sim.events.len == eventsBeforePick
+    check sim.currentCall() == pickCall
+    check sim.picks[pickCall.pair] == -1
+    check not sim.corrects[pickCall.pair]
