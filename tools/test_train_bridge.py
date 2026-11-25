@@ -7,7 +7,8 @@ import sys
 from pathlib import Path
 
 
-def play(binary: Path, teacher: bool, language: bool, invalid: str | None = None) -> None:
+def play(binary: Path, teacher: bool, language: bool, invalid: str | None = None,
+         invalid_decision: int = 0) -> None:
     manifest = Path(__file__).resolve().parent.parent / "coworld_manifest_template.json"
     process = subprocess.Popen(
         [str(binary), str(manifest), *(["--language"] if language else [])],
@@ -31,13 +32,13 @@ def play(binary: Path, teacher: bool, language: bool, invalid: str | None = None
         notes = {}
         while observation["kind"] == "decision":
             assert observation["inference_mode"] == ("text_action" if language else None)
-            if invalid is not None and decisions == 0:
+            if invalid is not None and decisions == invalid_decision:
                 rejected = request({"kind": "step", "decision_id": observation["decision_id"], "response": invalid})
-                assert rejected["kind"] == "consumed_rejection" and rejected["reason"]
-                assert all(glyph in observation["semantic_view"]["alphabet"] for glyph in rejected["action"]["tokens"])
-                observation = rejected["observation"]
-                decisions += 1
-                continue
+                assert rejected["kind"] == "rejected" and rejected["reason"]
+                assert rejected["action"] is None
+                assert rejected["raw_response"] == invalid
+                assert rejected["observation"] == {"kind": "terminal", "scores": None}
+                return
             encoding = request({"kind": "encode"})
             assert encoding["decision_id"] == observation["decision_id"]
             widths.add(len(encoding["values"]))
@@ -72,8 +73,11 @@ def play(binary: Path, teacher: bool, language: bool, invalid: str | None = None
             if language:
                 action["notes"] = f"seat-{seat}-decision-{decisions}"
                 notes[seat] = action["notes"]
+            payload = json.dumps(action)
+            if language and decisions == 2:
+                payload = f"```json\n{payload}\n```"
             result = request(
-                {"kind": "step", "decision_id": observation["decision_id"], "response": json.dumps(action)}
+                {"kind": "step", "decision_id": observation["decision_id"], "response": payload}
             )
             assert result["kind"] == "accepted" and result["action"] == action
             observation = result["observation"]
@@ -95,5 +99,7 @@ if __name__ == "__main__":
     for language in (False, True):
         for teacher in (True, False):
             play(binary, teacher, language)
-    play(binary, True, True, "not a JSON action")
-    play(binary, True, True, json.dumps({"tokens": ["outside-alphabet"]}))
+    play(binary, True, True, "not a JSON action", 0)
+    play(binary, True, True, 'Here is my move: {"tokens": ["x"]}', 0)
+    play(binary, True, True, json.dumps({"tokens": ["outside-alphabet"]}), 0)
+    play(binary, True, True, json.dumps({"pick": "A"}), 1)

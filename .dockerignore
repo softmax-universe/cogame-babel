@@ -6,3 +6,7 @@
 **/trajectories/
 .git
 nimcache
+tmp/
+dist/
+bin/
+nim.cfg

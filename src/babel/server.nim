@@ -43,7 +43,6 @@ type
     attempts: seq[DecisionAttempt]
     selected: Option[string]
     status: ActionStatus
-    fallbackOrigin: Option[string]
     terminal: bool
   GameState = object
     config: GameConfig
@@ -245,10 +244,12 @@ proc finishEpisode(runtimeConfig: RuntimeConfig, status: EpisodeStatus) =
     var cleanup = newJObject()
     for slot in targets:
       cleanup[$slot] = %(if slot in state.stoppedSlots: "acknowledged" else: "unresolved")
-      if slot notin state.stoppedSlots:
+      if slot notin state.stoppedSlots and finalStatus == esCompleted:
         finalStatus = esTruncated
     let privateOutcome = copy(results)
     privateOutcome["player_cleanup"] = cleanup
+    if finalStatus == esFailed:
+      privateOutcome["reason"] = %"failed_action"
     replayData = state.replayPayload(results)
     if state.trajectory.isSome:
       for staged in state.staged:
@@ -275,7 +276,7 @@ proc finishEpisode(runtimeConfig: RuntimeConfig, status: EpisodeStatus) =
         privateObservation["prompt_attempts"] = promptAttempts
         state.trajectory.get().recordDecision(staged.id, staged.seat, privateObservation,
           attempts, staged.selected, staged.executedAction, staged.status,
-          terminal = staged.terminal, fallbackOrigin = staged.fallbackOrigin)
+          terminal = staged.terminal, fallbackOrigin = none(string))
       var outcomes = newJObject()
       for seat in 0 ..< Seats: outcomes[$seat] = results["scores"][seat]
       if interruptionRequested(): finalStatus = esTruncated
@@ -324,6 +325,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     let config = state.config
     let gameStart = getMonoTime()
     var ownerStatus = esFailed
+    var abortedEpisode = false
     defer:
       gameServer.close()
     defer:
@@ -348,8 +350,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       echo "babel: starting with ", state.playerSockets.len, "/",
         config.tokens.len, " players connected"
       state.broadcastLocked()
-
-    let fallbackClient = newScriptedPolicy(config.seed)
 
     while not interruptionRequested():
       var simCopy: Sim
@@ -428,40 +428,51 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             observation: view, executedAction: newJNull(), attempts: attempts,
             selected: none(string), status: asMissing, terminal: true))
         break
-      var decision: Decision
-      var fellBack = response == nil or response{"source"}.getStr() == "fallback"
+      var status = asMissing
       var rejection = ""
-      var fallbackPolicy = if response == nil: "game-scripted" else: "player-scripted"
       var proposedAction = newJNull()
+      var actualAction = newJNull()
+      var aborted = false
       withLock stateLock:
         if response != nil:
-          let playerFallback = response["source"].getStr() == "fallback"
-          var modelResponse = none(string)
-          if response.hasKey("training_attempt") and response["training_attempt"].kind == JObject:
-            let evidence = readAttemptEvidence(response["training_attempt"])
-            if evidence.origin == aoModel and not playerFallback:
-              modelResponse = some(if evidence.response.kind == JString:
-                evidence.response.getStr() else: "")
-          let resolution = state.sim.resolveAction(call, $response["action"], view,
-            response{"source"}.getStr() != "llm", fallbackClient, modelResponse)
-          proposedAction = if playerFallback: newJNull() else: resolution.proposedAction
-          decision = resolution.decision
-          if not resolution.accepted:
-            fellBack = true
-            rejection = resolution.rejection
-            fallbackPolicy = resolution.fallbackOrigin
-            echo "babel: player action rejected; using scripted fallback"
-        else:
-          decision = fallbackClient.scriptedAction(state.sim, call)
-          if call.kind == ckSpeak:
-            state.sim.applySpeak(call.pair, decision.tokens, decision.notes, true)
+          let source = response["source"].getStr()
+          if source == "error":
+            status = asRejected
+            rejection = response{"error"}.getStr("player failed to produce an action")
+            aborted = true
+            echo "babel: round ", simCopy.round + 1, " pair ", call.pair,
+              " seat ", call.seat, " failed (player error); aborting episode unscored at ",
+              (getMonoTime() - gameStart).inSeconds, "s"
           else:
-            state.sim.applyPick(call.pair, decision.pick, decision.notes, true)
-        echo "babel: round ", simCopy.round + 1, " pair ", call.pair, " ",
-          decisionText(state.sim, call, decision), " at ",
-          (getMonoTime() - gameStart).inSeconds, "s"
+            var modelResponse = none(string)
+            if response.hasKey("training_attempt") and response["training_attempt"].kind == JObject:
+              let evidence = readAttemptEvidence(response["training_attempt"])
+              if evidence.origin == aoModel:
+                modelResponse = some(if evidence.response.kind == JString:
+                  evidence.response.getStr() else: "")
+            let resolution = state.sim.resolveAction(call, $response["action"],
+              source != "llm", modelResponse)
+            proposedAction = resolution.proposedAction
+            if resolution.accepted:
+              status = asAccepted
+              actualAction = state.sim.actionJson(call, resolution.decision)
+              echo "babel: round ", simCopy.round + 1, " pair ", call.pair, " ",
+                decisionText(state.sim, call, resolution.decision), " at ",
+                (getMonoTime() - gameStart).inSeconds, "s"
+            else:
+              status = asRejected
+              rejection = resolution.rejection
+              aborted = true
+              echo "babel: round ", simCopy.round + 1, " pair ", call.pair,
+                " seat ", call.seat, " rejected; aborting episode unscored at ",
+                (getMonoTime() - gameStart).inSeconds, "s"
+        else:
+          status = asMissing
+          aborted = true
+          echo "babel: round ", simCopy.round + 1, " pair ", call.pair,
+            " seat ", call.seat, " missing response; aborting episode unscored at ",
+            (getMonoTime() - gameStart).inSeconds, "s"
         if state.trajectory.isSome:
-          let actualAction = state.sim.actionJson(call, decision)
           var attempts: seq[DecisionAttempt]
           var selected = none(string)
           var privateEvidence = newJNull()
@@ -476,18 +487,18 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if privateEvidence.kind == JObject:
             var attempt = readAttemptEvidence(privateEvidence)
             if attempt.origin in {aoTeacher, aoHuman}: attempt.origin = aoUnknown
-            attempt.accepted = not fellBack
+            attempt.accepted = status == asAccepted
             attempt.parsedAction = proposedAction
-            if rejection.len > 0:
+            if rejection.len > 0 and (attempt.rejectionReason.isNone or response{"source"}.getStr() != "error"):
               attempt.rejectionReason = some(rejection)
             elif response == nil:
               attempt.rejectionReason = some(if lateResponse != nil:
                 "late player response after game decision deadline"
                 else: "game decision timeout before player response")
             attempts.add(attempt)
-            if not fellBack:
+            if status == asAccepted:
               selected = some(attempt.attemptId)
-          elif not fellBack:
+          elif status == asAccepted:
             let attemptId = "babel-" & $view["id"].getInt() & "-external"
             var external = newDecisionAttempt(attemptId, "external-babel", aoUnknown)
             external.response = response["action"]
@@ -497,18 +508,26 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             selected = some(attemptId)
           state.staged.add(StagedDecision(id: decisionId, seat: $call.seat,
             observation: view, attempts: attempts, selected: selected,
-            executedAction: actualAction, status: (if fellBack: asFallback else: asAccepted),
-            terminal: state.sim.done, fallbackOrigin: (if fellBack: some(fallbackPolicy) else: none(string))))
-        state.broadcastLocked()
+            executedAction: actualAction, status: status,
+            terminal: state.sim.done or aborted))
+        if not aborted:
+          state.broadcastLocked()
+
+      if aborted:
+        abortedEpisode = true
+        break
 
       ## Pace between rounds: after the pick that closes a round.
       if config.turnDelayMs > 0 and call.kind == ckPick and call.pair == 1:
         waitUntil(min(playDeadline, getMonoTime() + initDuration(milliseconds = config.turnDelayMs)))
 
     ## Let the verdict land before the final frame.
-    if config.turnDelayMs > 0:
-      waitUntil(min(playDeadline, getMonoTime() + initDuration(milliseconds = config.turnDelayMs)))
-    ownerStatus = if interruptionRequested() or state.sim.reason != "complete": esTruncated else: esCompleted
+    if abortedEpisode:
+      ownerStatus = esFailed
+    else:
+      if config.turnDelayMs > 0:
+        waitUntil(min(playDeadline, getMonoTime() + initDuration(milliseconds = config.turnDelayMs)))
+      ownerStatus = if interruptionRequested() or state.sim.reason != "complete": esTruncated else: esCompleted
 
 var gameThread: Thread[RuntimeConfig]
 
@@ -707,11 +726,11 @@ proc websocketHandler(
                 state.completedAttempts[id] = evidence
             if frameType == "action":
               let source = payload["source"].getStr()
-              if source notin ["llm", "scripted", "fallback"]:
+              if source notin ["llm", "scripted", "error"]:
                 raise newException(ValueError, "unknown action source")
               if source == "llm" and evidence.kind == JNull:
                 raise newException(ValueError, "native action has no attempt evidence")
-              if evidence.kind == JObject and source != "fallback":
+              if evidence.kind == JObject and source != "error":
                 let attempt = readAttemptEvidence(evidence)
                 if attempt.origin == aoModel:
                   if attempt.responseComplete != some(true) or

@@ -35,7 +35,11 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
             if view["slot"] == 0 and failure == "invalid-json":
                 text = "not a JSON action"
             elif view["slot"] == 0 and failure == "illegal-action":
-                text = json.dumps({"tokens": ["outside-alphabet"], "notes": "private-notes-fixture"})
+                text = json.dumps(
+                    {"tokens": ["outside-alphabet"], "notes": "private-notes-fixture"}
+                    if view["role"] == "speaker"
+                    else {"pick": "A", "notes": "private-notes-fixture"}
+                )
             call_id = str(uuid.uuid4())
             payload = {"id": "msg_" + call_id, "type": "message", "role": "assistant",
                        "model": "mock/served", "content": [{"type": "text", "text": text}],
@@ -141,15 +145,26 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
             events = [json.loads(line) for line in (output / "trajectory.jsonl").read_text().splitlines()]
             decisions = [event for event in events if event["event_type"] == "decision"]
             episode = events[-1]
-            expected = 8
-            assert len(decisions) == expected and episode["status"] == "completed"
-            assert episode["outcome"]["reason"] == "complete"
+            failing = failure in {"invalid-json", "illegal-action", "provider-error", "malformed-200", "timeout", "invalid-token-types", "invalid-probabilities", "invalid-probability-count", "invalid-usage"}
+            expected = 5 if failure == "timeout" else (1 if failing else 8)
+            assert len(decisions) == expected
+            if failing:
+                assert episode["status"] == "failed"
+                assert episode["participant_outcomes"] is None
+                assert not (output / "results.json").exists()
+                assert not (output / "replay.json").exists()
+            else:
+                assert episode["status"] == "completed"
+                assert episode["outcome"]["reason"] == "complete"
+                assert (output / "results.json").exists()
+                assert (output / "replay.json").exists()
             assert episode["source_revision"] == source
             assert len(calls) == (0 if failure == "unknown" else expected)
             recorded_calls = set()
-            fallbacks = 0
+            failed_decisions = 0
             for decision in decisions:
                 assert decision["visibility"] == "private"
+                assert decision["fallback_origin"] is None
                 assert decision["observation"]["prompt_selection"] == {
                     "bank": "babel-rules-v1", "variant": "reordered",
                     "selection": "mixed", "seed": 4,
@@ -172,9 +187,10 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
                                                           "native transport nhDeadline",
                                                           "late player response after game decision deadline"}
                     assert attempt["parsed_action"] is None
-                    assert decision["action_status"] == "fallback" and not attempt["accepted"]
+                    assert decision["action_status"] == "missing" and not attempt["accepted"]
+                    assert decision["executed_action"] is None
                     assert decision["selected_attempt_id"] is None
-                    fallbacks += 1
+                    failed_decisions += 1
                     continue
                 request, raw_response, raw_body = calls[call_id]
                 recorded_calls.add(call_id)
@@ -207,29 +223,37 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
                 else:
                     assert attempt["input_tokens"] is None and attempt["output_tokens"] is None
                 if invalid_sampling or invalid_usage:
-                    assert decision["action_status"] == "fallback" and not attempt["accepted"]
+                    assert decision["action_status"] == "rejected" and not attempt["accepted"]
                 if decision["action_status"] == "accepted":
                     assert decision["selected_attempt_id"] == attempt["attempt_id"]
                     assert attempt["accepted"] and attempt["parsed_action"] == decision["executed_action"]
                 else:
-                    fallbacks += 1
-                    assert decision["action_status"] == "fallback"
+                    failed_decisions += 1
+                    assert decision["action_status"] == "rejected"
                     assert not attempt["accepted"] and decision["selected_attempt_id"] is None
-                    assert decision["fallback_origin"] and attempt["rejection_reason"]
+                    assert decision["executed_action"] is None
+                    assert decision["fallback_origin"] is None and attempt["rejection_reason"]
+                    if failure == "invalid-json":
+                        assert attempt["response"] == "not a JSON action"
+                    elif failure == "illegal-action":
+                        assert attempt["response"] == json.dumps({"tokens": ["outside-alphabet"], "notes": "private-notes-fixture"})
             assert len(recorded_calls) == (0 if failure == "unknown" else expected - (1 if failure == "timeout" else 0))
             assert recorded_calls <= set(calls)
-            assert fallbacks == (2 if failure in {"invalid-json", "illegal-action", "provider-error", "malformed-200", "invalid-token-types", "invalid-probabilities", "invalid-probability-count", "invalid-usage"} else 1 if failure == "timeout" else 0)
+            assert failed_decisions == (1 if failing else 0)
             for log in logs: log.flush()
             public_logs = "".join(path.read_text() for path in output.glob("*.log"))
             assert "private-strategy-fixture" not in public_logs and "private-notes-fixture" not in public_logs
-            replay = (output / "replay.json").read_text()
-            assert "private-notes-fixture" not in replay
-            assert "private-strategy-fixture" not in replay and "platform_call_id" not in replay
-            assert all(identity not in replay for identity in calls)
+            if (output / "replay.json").exists():
+                replay = (output / "replay.json").read_text()
+                assert "private-notes-fixture" not in replay
+                assert "private-strategy-fixture" not in replay and "platform_call_id" not in replay
+                assert all(identity not in replay for identity in calls)
+                for sentinel in ("private-token-sentinel", "private-probability-sentinel", "private-usage-sentinel"):
+                    assert sentinel not in replay
             for sentinel in ("private-token-sentinel", "private-probability-sentinel", "private-usage-sentinel"):
-                assert sentinel not in public_logs and sentinel not in replay
+                assert sentinel not in public_logs
             assert (output / "trajectory.jsonl").stat().st_mode & 0o777 == 0o600
-            print(failure or "accepted", len(decisions), "decisions", fallbacks, "fallbacks", len(recorded_calls), "fixture response IDs joined")
+            print(failure or "accepted", len(decisions), "decisions", failed_decisions, "failed", len(recorded_calls), "fixture response IDs joined")
         finally:
             for process in processes:
                 if process.poll() is None:

@@ -1,6 +1,6 @@
 ## Native sidecar transport and canonical private prompt templates.
-## Missing endpoint selects unsupervised scripted fallback; retired provider
-## credentials never activate inference. The game server does not import this module.
+## Retired provider credentials never activate inference; missing endpoint
+## leaves the client disabled. The game server does not import this module.
 
 import
   std/[base64, json, math, monotimes, options, os, sets, strutils, tables],
@@ -57,7 +57,7 @@ proc newLlmClient*(): LlmClient =
     result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
     return
   result.disabled = true
-  echo "babel llm: no native endpoint; using unsupervised scripted fallback"
+  echo "babel llm: no native endpoint configured"
 
 proc newScriptedClient*(seed: int): LlmClient =
   ## Runs the baseline without resolving model credentials or opening a transport.

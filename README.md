@@ -11,7 +11,7 @@ ordered relation occurs once per six rounds). The speaker sees a target
 scene — a *shape* (circle, square, triangle, star), a *colour* (red, blue,
 green, yellow), and a *count* (1–4) — and sends a message of 1–8 glyphs.
 The listener sees the message and a lineup of four scenes (the target, a
-near miss, a partial match, a clear miss) labelled A–D and picks one.
+near miss, a partial match, a clear miss) indexed 0–3 and picks one.
 **Both score when the pick is right.** Nothing but glyphs crosses between
 seats, and every seat sees the 16 tokens under its own seeded symbols in
 its own order, so no convention can be agreed in advance: meaning has to
@@ -27,7 +27,7 @@ The game stages private evidence until bounded acknowledgements, then writes
 private traces before results and replay under one absolute cleanup deadline.
 The game owns hidden information, glyph validation, scores, and replay.
 The player uses a **scripted baseline** or the native LLM sidecar.
-Missing or invalid actions use the game's scripted fallback.
+Missing, invalid, or failed actions never fall back to any legal move; the episode aborts unscored while preserving private evidence.
 Unresolved worker shutdown seals a private truncated episode without results or replay.
 
 Seats play under **anonymous cog names** (Sprocket, Gizmo, …): policy
@@ -48,7 +48,7 @@ play between rounds.
   schedule, scenes and lineups, speak/pick, tallies, endings, replay
   derivation; shared by server, tests, and the wasm viewer
 - `src/babel/llm.nim` — player-side Claude transport and prompt building
-- `src/babel/game_policy.nim` — game-side action parsing and fallback
+- `src/babel/game_policy.nim` — game-side action parsing and scripted baseline
 - `src/babel/player_view.nim` — private decision observation
 - `src/babel/player_policy.nim` — player-side policies
 - `src/babel/server.nim` — mummy HTTP/WS server (player, global, replay)
@@ -104,7 +104,7 @@ uv run coworld upload-policy <babel image> --name my-babel \
 ```
 
 Or field the scripted coder: same image, `--env PLAYER_SCRIPTED=1`.
-Without a native endpoint, prompt players send an unsupervised scripted fallback.
+Without a native endpoint, prompt players report an explicit failure and do not substitute a scripted or synthetic move.
 
 Hosted prompt players use `COWORLD_LLM_ENDPOINT` and `/v1/messages` with the
 canonical model `anthropic/claude-haiku-4.5`. `COWORLD_LLM_MODEL` selects another
@@ -137,10 +137,11 @@ Private hosted trajectories use `COGAME_SAVE_TRAJECTORY_URI`, separate from
 replay. Enabling capture requires `COWORLD_EPISODE_ID`, `COWORLD_GAME_VERSION`,
 and `COWORLD_SOURCE_REVISION`. The game joins player attempt metadata over its
 authenticated action socket to the actual parsed/applied action and terminal
-outcome. Failed model calls and illegal actions retain rejected attempts and
-explicit fallback origins. The language bridge shares that resolution flow and
-returns `consumed_rejection` when the ordinary player/game would advance using
-a baseline; it does not invent a model retry. `COWORLD_LLM_TEMPERATURE` controls
+outcome. Failed model calls, timeouts, and illegal actions retain rejected or
+missing attempts with `executed_action: null` and abort the episode unscored
+without publishing normal results or replay. The language bridge shares that
+resolution flow and returns `rejected` with `action: null`, `raw_response`, and
+a terminal unscored observation; it does not invent a fallback or retry. `COWORLD_LLM_TEMPERATURE` controls
 the native request explicitly (default 1). Export private corpora outside the
 checkout; JSONL artifacts and known corpus directories are excluded from Docker
 build contexts.
