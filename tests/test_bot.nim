@@ -106,6 +106,8 @@ suite "scripted baseline":
     check parseSpeak(sim, seat, fenced).tokens == @[3, 9, 14]
     let plainFence = extractJsonObject("```\n{\"pick\":2}\n```")
     check parsePick(plainFence).pick == 2
+    for wrapped in ["```{\"pick\":2}```", "```json\n{\"pick\":2}```"]:
+      check parsePick(extractJsonObject(wrapped)).pick == 2
     ## Prose-wrapped JSON and non-object JSON are rejected.
     expect BabelError:
       discard extractJsonObject("Here is my move: {\"pick\":2}")

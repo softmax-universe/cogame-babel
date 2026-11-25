@@ -31,7 +31,7 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
                               .split("\nOperator guidance:", 1)[0])
             action = ({"tokens": [view["alphabet"][0]], "notes": "private-notes-fixture"}
                       if view["role"] == "speaker" else {"pick": 0, "notes": "private-notes-fixture"})
-            text = "```json\n" + json.dumps(action) + "\n```"
+            text = "```json\n" + json.dumps(action) + ("```" if view["role"] == "speaker" else "\n```")
             if view["slot"] == 0 and failure == "invalid-json":
                 text = "not a JSON action"
             elif view["slot"] == 0 and failure == "illegal-action":
