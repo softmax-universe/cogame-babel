@@ -67,6 +67,7 @@ type
     stopping: bool
     stopId: string
     stopIssuedAt, acknowledgementDeadline: MonoTime
+    playerFailure: JsonNode
     finished: bool
     trajectory: Option[DecisionTrajectory]
 
@@ -240,17 +241,20 @@ proc finishEpisode(runtimeConfig: RuntimeConfig, status: EpisodeStatus) =
   var finalStatus = status
   withLock stateLock:
     state.finished = true
-    results = state.sim.resultsJson()
+    if status != esFailed:
+      results = state.sim.resultsJson()
     var cleanup = newJObject()
     for slot in targets:
       cleanup[$slot] = %(if slot in state.stoppedSlots: "acknowledged" else: "unresolved")
       if slot notin state.stoppedSlots and finalStatus == esCompleted:
         finalStatus = esTruncated
-    let privateOutcome = copy(results)
+    let privateOutcome = if status == esFailed: newJObject() else: copy(results)
     privateOutcome["player_cleanup"] = cleanup
     if finalStatus == esFailed:
       privateOutcome["reason"] = %"failed_action"
-    replayData = state.replayPayload(results)
+      if state.playerFailure != nil: privateOutcome["failure"] = state.playerFailure
+    else:
+      replayData = state.replayPayload(results)
     if state.trajectory.isSome:
       for staged in state.staged:
         var attempts = staged.attempts
@@ -278,17 +282,18 @@ proc finishEpisode(runtimeConfig: RuntimeConfig, status: EpisodeStatus) =
           attempts, staged.selected, staged.executedAction, staged.status,
           terminal = staged.terminal, fallbackOrigin = none(string))
       var outcomes = newJObject()
-      for seat in 0 ..< Seats: outcomes[$seat] = results["scores"][seat]
+      if finalStatus == esCompleted:
+        for seat in 0 ..< Seats: outcomes[$seat] = results["scores"][seat]
       if interruptionRequested(): finalStatus = esTruncated
       state.trajectory.get().finish(finalStatus, privateOutcome,
         if finalStatus != esCompleted: newJNull() else: outcomes)
-    var names = newJArray()
-    for name in state.sim.names: names.add(%name)
-    let final = %*{"type": "final", "done": true, "scores": results["scores"],
-      "correct": results["correct"], "asSpeaker": results["asSpeaker"],
-      "asListener": results["asListener"], "names": names,
-      "rounds": results["rounds"], "reason": results["reason"]}
     if not interruptionRequested() and status != esFailed:
+      var names = newJArray()
+      for name in state.sim.names: names.add(%name)
+      let final = %*{"type": "final", "done": true, "scores": results["scores"],
+        "correct": results["correct"], "asSpeaker": results["asSpeaker"],
+        "asListener": results["asListener"], "names": names,
+        "rounds": results["rounds"], "reason": results["reason"]}
       for slot, socket in state.playerSockets: socket.send($final)
       state.broadcastLocked()
   if state.trajectory.isSome:
@@ -298,7 +303,10 @@ proc finishEpisode(runtimeConfig: RuntimeConfig, status: EpisodeStatus) =
       of "POST": ahPost
       else: raise newException(ValueError, "trajectory method must be PUT or POST")
     state.trajectory.get().writeTrajectoryArtifact(getEnv(CogameSaveTrajectoryUriEnv), cleanupDeadline, httpMethod)
-  if not interruptionRequested() and status != esFailed:
+  if state.playerFailure != nil:
+    writeArtifact(getEnv("COGAME_PLAYER_FAILURE_URI"), $state.playerFailure, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD", cleanupDeadline)
+  elif not interruptionRequested() and status != esFailed:
     writeArtifact(runtimeConfig.resultsUri, $results, "application/json", "COGAME_RESULTS_METHOD", cleanupDeadline)
     writeArtifact(runtimeConfig.replayUri, replayData, "application/octet-stream", "COGAME_SAVE_REPLAY_METHOD", cleanupDeadline)
     if getMonoTime() + initDuration(milliseconds = 500) < cleanupDeadline:
@@ -319,6 +327,35 @@ proc decisionText(sim: Sim, call: Call, decision: Decision): string =
     sim.names[call.seat] & " picks " & lineupLetter(decision.pick)
   else:
     ""
+
+proc gamePlayerFailure(round: int, call: Call, response: JsonNode,
+    startedAttempt, hasSocket: bool, rejection: string): JsonNode =
+  var detail: string
+  var kind = "player_error"
+  if response == nil:
+    if startedAttempt:
+      kind = "episode_inconclusive"
+      detail = "model request did not finish before the decision deadline"
+    else:
+      detail = if hasSocket: "player missed the decision deadline" else: "player disconnected"
+  elif response{"source"}.getStr() == "error":
+    let summary = modelFailureSummary(response{"training_attempt"}, response{"error"}.getStr())
+    detail = summary.message
+    kind = summary.kind
+  else:
+    # Some parser errors append the submitted value after a colon.
+    let rule = rejection.split(':', 1)[0]
+    case rule
+    of "no tokens in response", "no pick in response", "tokens must be an array of glyphs",
+        "tokens must be glyph strings", "each token must be exactly one glyph",
+        "not a glyph of this alphabet", "a message is 1..8 tokens", "notes must be a string",
+        "pick must be an integer 0..3", "model response differs from player action":
+      detail = rule
+    else:
+      detail = if call.kind == ckSpeak: "invalid speaker action" else: "invalid listener action"
+  let message = "round " & $round & " pair " & $call.pair &
+    " seat " & $call.seat & ": " & detail
+  result = %*{"kind": kind, "failed_policy_index": call.seat, "message": message}
 
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
@@ -440,9 +477,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             status = asRejected
             rejection = response{"error"}.getStr("player failed to produce an action")
             aborted = true
-            echo "babel: round ", simCopy.round + 1, " pair ", call.pair,
-              " seat ", call.seat, " failed (player error); aborting episode unscored at ",
-              (getMonoTime() - gameStart).inSeconds, "s"
           else:
             var modelResponse = none(string)
             if response.hasKey("training_attempt") and response["training_attempt"].kind == JObject:
@@ -463,15 +497,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               status = asRejected
               rejection = resolution.rejection
               aborted = true
-              echo "babel: round ", simCopy.round + 1, " pair ", call.pair,
-                " seat ", call.seat, " rejected; aborting episode unscored at ",
-                (getMonoTime() - gameStart).inSeconds, "s"
         else:
           status = asMissing
           aborted = true
-          echo "babel: round ", simCopy.round + 1, " pair ", call.pair,
-            " seat ", call.seat, " missing response; aborting episode unscored at ",
-            (getMonoTime() - gameStart).inSeconds, "s"
+        if aborted:
+          state.playerFailure = gamePlayerFailure(simCopy.round + 1, call, response,
+            state.pendingAttempts.hasKey(decisionId), hasSocket, rejection)
+          echo "babel: ", state.playerFailure["message"].getStr()
         if state.trajectory.isSome:
           var attempts: seq[DecisionAttempt]
           var selected = none(string)
@@ -741,7 +773,8 @@ proc websocketHandler(
                   var text = ""
                   for contentBlock in body["content"]:
                     if contentBlock["type"].getStr() == "text": text.add(contentBlock["text"].getStr())
-                  if attempt.response != %text or attempt.model != some(body["model"].getStr()):
+                  let model = body{"model"}.getStr(attempt.request["model"].getStr())
+                  if attempt.response != %text or attempt.model != some(model):
                     raise newException(ValueError, "native body differs from completion response or model")
               state.pendingActions[id] = (payload: payload, receivedAt: receivedAt)
         elif frameType == "stopped":
