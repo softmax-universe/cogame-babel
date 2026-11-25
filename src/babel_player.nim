@@ -9,17 +9,8 @@ import bitworld/[decision_trajectory, native_stop, native_websocket]
 import babel/[llm, player_policy, prompts]
 
 const DefaultPrompt = """
-Invent a compositional code and stick to it: one glyph for each shape,
-one for each colour, one for each count, always sent in the order
-shape, colour, count. As speaker, be perfectly consistent from round one
-and never reuse a glyph for two meanings; a partner can only learn a code
-that does not move. As listener, treat every past round as evidence:
-after each verdict, update a per-partner dictionary mapping each glyph
-you received to the attribute values of the revealed target, and write
-that dictionary into your notes every round so it survives. When the
-message is ambiguous, prefer the lineup card that agrees with the most
-glyphs, and between close candidates prefer the near miss that shares
-two attributes with your best reading over a wild guess.
+As speaker, use a consistent glyph for each shape, colour, and count, in that order.
+As listener, use feedback and private notes to learn each partner's code and pick the best match.
 """
 
 type PlayerCall = object
@@ -72,10 +63,11 @@ proc runDecision(call: PlayerCall) {.gcsafe.} =
       source = "llm"
     except CatchableError as error:
       failure = error.msg
-      echo "babel player: model call failed"
       action = newJNull()
       source = "error"
     attempt = client.lastCall.privateAttempt(call.decisionId & "-model", failure).attemptEvidenceJson()
+    if failure.len > 0:
+      echo "babel player: ", modelFailureSummary(attempt, failure).message
     {.gcsafe.}:
       withLock evidenceLock: workerEvidence = $attempt
   if not interruptionRequested():

@@ -31,7 +31,7 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
                               .split("\nOperator guidance:", 1)[0])
             action = ({"tokens": [view["alphabet"][0]], "notes": "private-notes-fixture"}
                       if view["role"] == "speaker" else {"pick": 0, "notes": "private-notes-fixture"})
-            text = json.dumps(action)
+            text = "```json\n" + json.dumps(action) + "\n```"
             if view["slot"] == 0 and failure == "invalid-json":
                 text = "not a JSON action"
             elif view["slot"] == 0 and failure == "illegal-action":
@@ -103,6 +103,7 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
                   else subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip())
         env = {**os.environ, "COGAME_HOST": "127.0.0.1", "COGAME_PORT": str(port),
                "COGAME_CONFIG_URI": (output / "config.json").as_uri(),
+               "COGAME_PLAYER_FAILURE_URI": (output / "player_failure.json").as_uri(),
                "COGAME_RESULTS_URI": (output / "results.json").as_uri(),
                "COGAME_SAVE_REPLAY_URI": (output / "replay.json").as_uri(),
                "COGAME_SAVE_TRAJECTORY_URI": (output / "trajectory.jsonl").as_uri(),
@@ -149,11 +150,17 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
             expected = 5 if failure == "timeout" else (1 if failing else 8)
             assert len(decisions) == expected
             if failing:
+                declaration = json.loads((output / "player_failure.json").read_text())
+                assert declaration == episode["outcome"]["failure"]
+                assert declaration["failed_policy_index"] == int(decisions[-1]["seat"])
+                assert declaration["kind"] == ("player_error" if failure in {"invalid-json", "illegal-action"} else "episode_inconclusive")
+                assert declaration["message"] and "private" not in declaration["message"]
                 assert episode["status"] == "failed"
                 assert episode["participant_outcomes"] is None
                 assert not (output / "results.json").exists()
                 assert not (output / "replay.json").exists()
             else:
+                assert not (output / "player_failure.json").exists()
                 assert episode["status"] == "completed"
                 assert episode["outcome"]["reason"] == "complete"
                 assert (output / "results.json").exists()

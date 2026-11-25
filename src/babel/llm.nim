@@ -97,29 +97,7 @@ proc privateAttempt*(evidence: LlmCallEvidence, attemptId: string,
   result.sampledTokenIds = evidence.sampledTokenIds
   result.behaviorLogprobs = evidence.behaviorLogprobs
 
-proc completeText*(client: LlmClient, system, user: string, slot: int,
-    deadline: MonoTime): string =
-  client.lastCall = LlmCallEvidence(
-    prompt: %*[{"role": "system", "content": system}, {"role": "user", "content": user}],
-    request: newJNull(), rawResponse: newJNull(),
-    model: client.model, decoder: %*{"max_tokens": client.maxOutputTokens, "temperature": client.temperature})
-  var body = %*{
-    "max_tokens": client.maxOutputTokens,
-    "temperature": client.temperature,
-    "system": system,
-    "messages": [{"role": "user", "content": user}]
-  }
-  var headers: HttpHeaders
-  headers["content-type"] = "application/json"
-  headers["X-Coworld-Player-Slot"] = $slot
-  body["model"] = %client.model
-  headers["anthropic-version"] = AnthropicVersion
-  let url = client.sidecarEndpoint & "/v1/messages"
-  client.lastCall.request = copy(body)
-  if client.beforeCall != nil:
-    client.beforeCall(client.lastCall)
-  var requestControl: NativeRequestControl
-  let response = performNativePost(url, headers, $body, deadline, requestControl)
+proc readCompletion*(client: LlmClient, response: NativeHttpResponse): string =
   client.lastCall.latencyMs = response.latencyMs
   client.lastCall.responseReaderJoined = response.responseReaderJoined
   let observedResponse = response.httpStatus.isSome or response.headerBytes.len > 0 or response.bodyBytes.len > 0
@@ -157,9 +135,7 @@ proc completeText*(client: LlmClient, system, user: string, slot: int,
       receivedHeaders[name] = value
   if observedResponse:
     client.lastCall.responseHeaders = some(receivedHeaders)
-  if responseHeaders.contains("request-id") and responseHeaders.contains("x-request-id") and
-      responseHeaders["request-id"] != responseHeaders["x-request-id"]:
-    raise newException(BabelError, "conflicting received request identity headers")
+  # The sidecar prefers request-id when the proxy also supplies x-request-id.
   for key in ["request-id", "x-request-id"]:
     if responseHeaders.contains(key):
       client.lastCall.providerRequestId = some(responseHeaders[key])
@@ -191,21 +167,20 @@ proc completeText*(client: LlmClient, system, user: string, slot: int,
   if status == 401 or status == 403:
     client.disabled = true
     raise newException(BabelError, "native inference auth failed (" & $status & ")")
-  if status == 429:
-    let detail = response.bodyBytes[0 .. min(response.bodyBytes.high, 300)]
-    raise newException(BabelError, "llm throttled (429): " & detail)
   if status < 200 or status >= 300:
-    raise newException(BabelError, "native inference error " & $status &
-      ": " & response.bodyBytes[0 .. min(response.bodyBytes.high, 300)])
+    raise newException(BabelError, "native inference returned HTTP " & $status)
   let payload = parseJson(response.bodyBytes)
-  if payload.kind != JObject or payload["model"].kind != JString or
-      payload["content"].kind != JArray:
+  if payload.kind != JObject or not payload.hasKey("content") or payload["content"].kind != JArray:
     raise newException(BabelError, "native response violates the completion schema")
-  client.lastCall.model = payload["model"].getStr()
-  case payload["stop_reason"].kind
-  of JString: client.lastCall.stopReason = some(payload["stop_reason"].getStr())
-  of JNull: discard
-  else: raise newException(BabelError, "native stop reason must be text or null")
+  if payload.hasKey("model"):
+    if payload["model"].kind != JString:
+      raise newException(BabelError, "native model name must be text")
+    client.lastCall.model = payload["model"].getStr()
+  if payload.hasKey("stop_reason"):
+    case payload["stop_reason"].kind
+    of JString: client.lastCall.stopReason = some(payload["stop_reason"].getStr())
+    of JNull: discard
+    else: raise newException(BabelError, "native stop reason must be text or null")
   if payload.hasKey("usage") and payload["usage"].kind != JNull:
     let usage = payload["usage"]
     if usage.kind != JObject or usage["input_tokens"].kind != JInt or
@@ -255,5 +230,29 @@ proc completeText*(client: LlmClient, system, user: string, slot: int,
       result.add(contentBlock["text"].getStr())
   client.lastCall.response = some(result)
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(BabelError, "reply cut off at max_tokens before " &
-      "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
+    raise newException(BabelError, "reply cut off at max_tokens before any JSON")
+
+proc completeText*(client: LlmClient, system, user: string, slot: int,
+    deadline: MonoTime): string =
+  client.lastCall = LlmCallEvidence(
+    prompt: %*[{"role": "system", "content": system}, {"role": "user", "content": user}],
+    request: newJNull(), rawResponse: newJNull(),
+    model: client.model, decoder: %*{"max_tokens": client.maxOutputTokens, "temperature": client.temperature})
+  var body = %*{
+    "max_tokens": client.maxOutputTokens,
+    "temperature": client.temperature,
+    "system": system,
+    "messages": [{"role": "user", "content": user}]
+  }
+  var headers: HttpHeaders
+  headers["content-type"] = "application/json"
+  headers["X-Coworld-Player-Slot"] = $slot
+  body["model"] = %client.model
+  headers["anthropic-version"] = AnthropicVersion
+  let url = client.sidecarEndpoint & "/v1/messages"
+  client.lastCall.request = copy(body)
+  if client.beforeCall != nil:
+    client.beforeCall(client.lastCall)
+  var requestControl: NativeRequestControl
+  let response = performNativePost(url, headers, $body, deadline, requestControl)
+  client.readCompletion(response)

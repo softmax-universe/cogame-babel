@@ -213,11 +213,7 @@ proc extractJsonObject*(text: string): JsonNode =
       raise newException(BabelError, "closing Markdown fence must be on its own line")
     candidate = inner.strip()
   if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
-    var head = text.strip()
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
-    raise newException(BabelError, "response must be a JSON object: " &
-      head.replace("\n", " "))
+    raise newException(BabelError, "response must be a JSON object")
   try:
     result = parseJson(candidate)
   except CatchableError as error:
