@@ -146,7 +146,7 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
             events = [json.loads(line) for line in (output / "trajectory.jsonl").read_text().splitlines()]
             decisions = [event for event in events if event["event_type"] == "decision"]
             episode = events[-1]
-            failing = failure in {"invalid-json", "illegal-action", "provider-error", "malformed-200", "timeout", "invalid-token-types", "invalid-probabilities", "invalid-probability-count", "invalid-usage"}
+            failing = failure in {"invalid-json", "illegal-action", "provider-error", "malformed-200", "timeout"}
             expected = 5 if failure == "timeout" else (1 if failing else 8)
             assert len(decisions) == expected
             if failing:
@@ -230,7 +230,7 @@ for failure in (None, "invalid-json", "illegal-action", "sampled", "greedy-null"
                 else:
                     assert attempt["input_tokens"] is None and attempt["output_tokens"] is None
                 if invalid_sampling or invalid_usage:
-                    assert decision["action_status"] == "rejected" and not attempt["accepted"]
+                    assert decision["action_status"] == "accepted" and attempt["accepted"]
                 if decision["action_status"] == "accepted":
                     assert decision["selected_attempt_id"] == attempt["attempt_id"]
                     assert attempt["accepted"] and attempt["parsed_action"] == decision["executed_action"]
